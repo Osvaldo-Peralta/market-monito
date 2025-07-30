@@ -1,0 +1,7 @@
+# Ignorar archivos de configuración de IDEs y directorios
+.env
+__pycache__
+reportes/*
+# Entornos virtuales
+venv/
+shorts/
