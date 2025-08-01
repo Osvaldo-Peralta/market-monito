@@ -1,100 +1,93 @@
+# modules/top_gainers.py
 import yfinance as yf
-import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import datetime
+import time
+import csv
 from config import CONFIG
+from utils.notificaciones import enviar_telegram, mercado_abierto # Importar mercado_abierto
 
-def obtener_top_gainers(top_n=10, umbral_minimo=10.0):
-    print("🔍 Obteniendo lista de acciones S&P500...")
-    try:
-        tabla = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
-        sp500 = tabla[0]
-        tickers = sp500['Symbol'].tolist()
-
-        print(f"📡 Consultando precios en tiempo real para {len(tickers)} acciones...")
-        data = yf.download(tickers, period="1d", interval="1m", group_by="ticker", auto_adjust=True, threads=True, progress=False)
-
-        resultados = []
-        for ticker in tickers:
-            try:
-                df = data[ticker] if isinstance(data, dict) else data.xs(ticker, level=0, axis=1)
-                if df.empty or len(df) < 2:
-                    continue
-
-                apertura = df["Open"].iloc[0]
-                precio_actual = df["Close"].iloc[-1]
-
-                if apertura > 0:
-                    cambio = ((precio_actual - apertura) / apertura) * 100
-                    if cambio >= umbral_minimo:
-                        resultados.append((ticker, cambio, apertura, precio_actual))
-            except Exception:
-                continue
-
-        resultados.sort(key=lambda x: x[1], reverse=True)
-        periodo = "DÍA ACTUAL"
-        return resultados[:top_n], periodo
-
-    except Exception as e:
-        print(f"❌ Error crítico en obtener_top_gainers: {str(e)}")
-        return [], ""
-
-
-def enviar_reporte_gainers(gainers, periodo, umbral_minimo):
-    if not gainers:
-        print(f"⚠️ No se encontraron acciones con ganancias > {umbral_minimo}%")
-        # Mensaje alternativo cuando no hay ganadores significativos
-        mensaje = (
-            f"ℹ️ *REPORTE TOP GAINERS - {datetime.now().strftime('%Y-%m-%d')}*\n\n"
-            f"No se encontraron acciones con ganancias superiores al {umbral_minimo}%\n"
-            f"El mercado no presentó movimientos significativos en el período analizado."
-        )
-        enviar_telegram(mensaje)
-        return
-    
-    fecha = datetime.now().strftime("%Y-%m-%d")
-    mensaje = f"🏆 *TOP GAINERS (>{umbral_minimo}%) - {fecha} ({periodo})*\n\n"
-    
-    for i, (ticker, cambio, apertura, cierre) in enumerate(gainers):
-        mensaje += (
-            f"{i+1}. *{ticker}*: +{cambio:.2f}%\n"
-            f"   • Apertura: ${apertura:.2f}\n"
-            f"   • Cierre: ${cierre:.2f}\n\n"
-        )
-    
-    mensaje += (
-        f"_Estas acciones han mostrado ganancias significativas y podrían ser "
-        f"candidatas para estrategias de venta en corto._\n\n"
-        f"🔍 Recomendación: Analizar gráficos y fundamentales antes de operar."
-    )
-    
-    enviar_telegram(mensaje)
-    # Guardar CSV
-    df_gainers = pd.DataFrame(gainers, columns=["Ticker", "Cambio(%)", "Apertura", "Cierre"])
-    nombre_archivo = f"reportes/top_gainers_{fecha}.csv"
-    df_gainers.to_csv(nombre_archivo, index=False)
-    print(f"📁 Reporte top gainers guardado en: {nombre_archivo}")
-
-
-def enviar_telegram(mensaje):
-    url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM']['TOKEN']}/sendMessage"
-    payload = {
-        "chat_id": CONFIG["TELEGRAM"]["CHAT_ID"],
-        "text": mensaje,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=30)
-        if response.status_code == 200:
-            print("✅ Reporte top gainers enviado a Telegram")
-        else:
-            print(f"❌ Error Telegram ({response.status_code}): {response.text}")
-    except Exception as e:
-        print(f"❌ Error enviando a Telegram: {str(e)}")
+def obtener_hora_actual_et():
+    return datetime.datetime.now(CONFIG["MERCADO"]["ZONA_HORARIA"])
 
 def run_top_gainers():
-    print("\n🔍 Buscando acciones con ganancias significativas...")
-    umbral_minimo = 10.0  # Mínimo 10% de ganancia
-    gainers, periodo = obtener_top_gainers(10, umbral_minimo)  # Top 10 con ganancia > 10%
-    enviar_reporte_gainers(gainers, periodo, umbral_minimo)
+    # Verificar si el mercado está abierto antes de ejecutar
+    if not mercado_abierto():
+        print("ℹ️  Módulo Top Gainers no ejecutado: Mercado cerrado.")
+        return # Salir de la función si el mercado está cerrado
+
+    ahora = obtener_hora_actual_et()
+    hoy = ahora.date()
+    tz = CONFIG["MERCADO"]["ZONA_HORARIA"]
+    # Crear el datetime de apertura con la zona horaria correcta
+    apertura = tz.localize(datetime.datetime.combine(hoy, datetime.time(9, 30)))
+    
+    print(f"📈 Calculando top gainers desde apertura ({apertura.strftime('%H:%M')} ET)...")
+
+    datos_ganadores = []
+    
+    for ticker in CONFIG["TOP_GAINERS_WATCHLIST"]:
+        try:
+            # Corregido: Uso de Ticker.history() para mayor robustez
+            ticker_obj = yf.Ticker(ticker)
+            # Obtener datos desde la apertura hasta ahora (intervalo 5m)
+            data = ticker_obj.history(start=apertura, end=ahora, interval="5m", prepost=False) 
+            
+            if data.empty:
+                print(f"⚠️ No hay datos para {ticker} en el rango solicitado.")
+                continue
+            
+            # Asegurarse de que hay al menos dos puntos para calcular el cambio
+            if len(data) < 2:
+                print(f"⚠️ Datos insuficientes para {ticker}.")
+                continue
+
+            # Precio de apertura (primer valor disponible después de las 9:30)
+            precio_apertura = data.iloc[0]['Open'] 
+            # Precio actual (último cierre)
+            precio_actual = data.iloc[-1]['Close'] 
+            
+            if precio_apertura <= 0:
+                print(f"⚠️ Precio de apertura inválido para {ticker}.")
+                continue
+
+            cambio_pct = ((precio_actual - precio_apertura) / precio_apertura) * 100
+            datos_ganadores.append((
+                ticker,
+                round(cambio_pct, 2),
+                round(precio_apertura, 2),
+                round(precio_actual, 2)
+            ))
+        except yf.YFinanceError as e: # Manejo de errores específicos de yfinance
+            print(f"⚠️ Error de YFinance con {ticker}: {str(e)}")
+        except Exception as e:
+            print(f"⚠️ Error general con {ticker}: {str(e)}")
+            continue
+
+    # Ordenar y seleccionar top 3
+    datos_ganadores.sort(key=lambda x: x[1], reverse=True)
+    top_3 = datos_ganadores[:3]
+
+    if not top_3:
+        print("⚠️ No se encontraron datos para top gainers")
+        return
+
+    # Generar mensaje
+    mensaje = "🏆 Top Gainers desde apertura:\n"
+    for ticker, cambio, apertura, actual in top_3:
+        mensaje += f"• {ticker}: {cambio:+.2f}% | ${apertura:.2f} → ${actual:.2f}\n"
+
+    print(mensaje)
+    enviar_telegram(mensaje)
+
+    # Guardar CSV
+    nombre_csv = f"reporte_top_gainers_{hoy}.csv"
+    try:
+        with open(nombre_csv, 'a', newline='', encoding='utf-8') as f: # Agregado encoding
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(["Ticker", "Cambio %", "Apertura", "Actual", "Hora"])
+            for item in top_3:
+                writer.writerow([item[0], item[1], item[2], item[3], ahora.strftime("%H:%M:%S")])
+        print(f"💾 Reporte Top Gainers guardado en {nombre_csv}")
+    except Exception as e:
+        print(f"⚠️ Error guardando CSV {nombre_csv}: {str(e)}")
